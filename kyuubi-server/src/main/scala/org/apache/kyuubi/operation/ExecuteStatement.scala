@@ -27,7 +27,7 @@ import org.apache.kyuubi.config.KyuubiConf.OPERATION_QUERY_TIMEOUT_MONITOR_ENABL
 import org.apache.kyuubi.metrics.{MetricsConstants, MetricsSystem}
 import org.apache.kyuubi.operation.FetchOrientation.FETCH_NEXT
 import org.apache.kyuubi.operation.log.OperationLog
-import org.apache.kyuubi.session.Session
+import org.apache.kyuubi.session.{KyuubiSessionImpl, Session}
 import org.apache.kyuubi.shaded.hive.service.rpc.thrift.{TGetOperationStatusResp, TOperationState, TProtocolVersion}
 import org.apache.kyuubi.shaded.hive.service.rpc.thrift.TOperationState._
 
@@ -65,6 +65,20 @@ class ExecuteStatement(
 
   private def executeStatement(): Unit = {
     try {
+      if (shouldRunAsync) {
+        session match {
+          case sessionImpl: KyuubiSessionImpl =>
+            // make sure engine launched
+            sessionImpl.waitForEngineLaunched()
+            if (state.equals(OperationState.CLOSED) || state.equals(OperationState.CANCELED)) {
+              // During asynchronous execution, if user cancels the query before
+              // engine starts, the query will not be executed further.
+              throw KyuubiSQLException(s"Operation ${this.handle} has been" +
+                s" canceled/closed before engine launched")
+            }
+          case _ =>
+        }
+      }
       // We need to avoid executing query in sync mode, because there is no heartbeat mechanism
       // in thrift protocol, in sync mode, we cannot distinguish between long-run query and
       // engine crash without response before socket read timeout.
@@ -76,6 +90,9 @@ class ExecuteStatement(
 
   private def waitStatementComplete(): Unit =
     try {
+      if (shouldRunAsync) {
+        executeStatement()
+      }
       setState(OperationState.RUNNING)
       var statusResp: TGetOperationStatusResp = null
 
@@ -147,7 +164,20 @@ class ExecuteStatement(
       }
       // see if anymore log could be fetched
       fetchQueryLog()
-    } catch onError()
+    } catch onError().andThen(_ => {
+        if (_remoteOpHandle != null && (state.equals(OperationState.CANCELED) ||
+            state.equals(OperationState.CLOSED))) {
+          // make sure remote operation closed
+          logger.warn(s"Operation ${this.handle} has been closed," +
+            s" close remote operation ${_remoteOpHandle} now")
+          client.closeOperation(_remoteOpHandle)
+        }
+        if (getSession.sessionManager.getSessionOption(getSession.handle).isEmpty) {
+          // close remote session in case user close session before engine launched
+          logger.warn(s"Session ${getSession.handle} has been closed, close remote session now")
+          client.closeSession()
+        }
+      })
     finally {
       shutdownTimeoutMonitor()
     }
@@ -168,7 +198,9 @@ class ExecuteStatement(
     if (isTimeoutMonitorEnabled) {
       addTimeoutMonitor(queryTimeout)
     }
-    executeStatement()
+    if (!shouldRunAsync) {
+      executeStatement()
+    }
     val sessionManager = session.sessionManager
     val asyncOperation: Runnable = () => waitStatementComplete()
     try {

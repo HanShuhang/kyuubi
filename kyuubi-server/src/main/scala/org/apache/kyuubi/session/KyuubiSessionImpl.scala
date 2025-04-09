@@ -231,12 +231,14 @@ class KyuubiSessionImpl(
 
   override protected def runOperation(operation: Operation): OperationHandle = {
     if (operation != launchEngineOp) {
-      try {
-        waitForEngineLaunched()
-      } catch {
-        case t: Throwable =>
-          operation.close()
-          throw t
+      if (!sessionConf.get(SESSION_ENGINE_LAUNCH_ASYNC)) {
+        try {
+          waitForEngineLaunched()
+        } catch {
+          case t: Throwable =>
+            operation.close()
+            throw t
+        }
       }
       sessionEvent.totalOperations += 1
     }
@@ -245,7 +247,7 @@ class KyuubiSessionImpl(
 
   @volatile private var engineLaunched: Boolean = false
 
-  private def waitForEngineLaunched(): Unit = {
+  def waitForEngineLaunched(): Unit = {
     if (!engineLaunched) {
       Option(launchEngineOp).foreach { op =>
         val waitingStartTime = System.currentTimeMillis()
